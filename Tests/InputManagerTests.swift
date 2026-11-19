@@ -17,6 +17,7 @@ extension InputManager {
     }
 
     func drainTestInput() async { await inputSendTask?.value }
+    func drainTestMouseModeRefresh() async { await mouseModeRefreshTask?.value }
     func testReleaseKeys() { releaseRemoteKeys() }
 }
 
@@ -83,6 +84,15 @@ struct InputTests {
         await manager.drainTestInput()
         let releases = await client.socket.takeKeys()
         precondition(releases == ["MetaLeft:down", "KeyA:down", "KeyA:up", "MetaLeft:up"])
+
+        client.activeMouseMode = false
+        manager.refreshGLKVMMouseMode(for: client, savedMode: true)
+        await manager.drainTestMouseModeRefresh()
+        precondition(!manager.isGLKVMAbsoluteMouseMode, "Active relative HID mode must take precedence")
+        client.activeMouseMode = nil
+        manager.refreshGLKVMMouseMode(for: client)
+        await manager.drainTestMouseModeRefresh()
+        precondition(manager.isGLKVMAbsoluteMouseMode, "Use the saved mode when HID mode is unavailable")
 
         manager.isMouseCaptureEnabled = true
         manager.invertScrolling = false

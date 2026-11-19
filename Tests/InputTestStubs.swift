@@ -6,7 +6,9 @@ struct InputEvent { let type: String; let data: [String: JSONValue] }
 final class GLKVMClient {
     struct Config { let isAbsoluteMouse = true; let keymap = "en-us" }
     let socket = WebSocketClient()
+    var activeMouseMode: Bool?
     var httpKeys: [String] = []
+    func getActiveMouseMode() async throws -> Bool? { activeMouseMode }
     func getSystemConfig() async throws -> Config { Config() }
     func hidPrint(text: String, keymap: String?) async throws { fatalError("Clipboard paste must not intercept forwarded shortcuts") }
     func sendHidKey(key: String, state: Bool) async throws { httpKeys.append("\(key):\(state ? "down" : "up")") }

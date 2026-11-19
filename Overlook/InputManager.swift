@@ -94,28 +94,36 @@ class InputManager: ObservableObject {
         isGLKVMAbsoluteMouseMode = true
         pendingAbsoluteMouseMove = nil
         pendingRelativeMouseMove = nil
-        if client == nil {
+        guard let client else {
             disconnectGLKVMWebSocket()
             return
         }
         Task { [weak self] in
             await self?.reconnectGLKVMWebSocketIfNeeded()
         }
+        refreshGLKVMMouseMode(for: client)
+    }
+
+    func refreshGLKVMMouseMode(for client: GLKVMClient, savedMode: Bool? = nil) {
+        guard glkvmClient === client else { return }
+        mouseModeRefreshTask?.cancel()
         mouseModeRefreshTask = Task { [weak self, weak client] in
             guard let client else { return }
-            do {
-                let config = try await client.getSystemConfig()
-                await MainActor.run {
-                    guard let self, self.glkvmClient === client else { return }
-                    self.setGLKVMAbsoluteMouseMode(config.isAbsoluteMouse)
+            // The saved console preference can differ from the mouse HID the firmware is using.
+            var mode = try? await client.getActiveMouseMode()
+            guard !Task.isCancelled else { return }
+            if mode == nil {
+                mode = savedMode
+                if mode == nil {
+                    mode = (try? await client.getSystemConfig())?.isAbsoluteMouse
                 }
-            } catch {
-                // Keep the default absolute-mode behavior if settings cannot be loaded.
             }
+            guard !Task.isCancelled, let self, self.glkvmClient === client, let mode else { return }
+            self.setGLKVMAbsoluteMouseMode(mode)
         }
     }
 
-    func setGLKVMAbsoluteMouseMode(_ isAbsolute: Bool) {
+    private func setGLKVMAbsoluteMouseMode(_ isAbsolute: Bool) {
         guard isGLKVMAbsoluteMouseMode != isAbsolute else { return }
         isGLKVMAbsoluteMouseMode = isAbsolute
         pendingAbsoluteMouseMove = nil

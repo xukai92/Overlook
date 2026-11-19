@@ -163,6 +163,7 @@ struct CaptureSidebarView: View {
     @EnvironmentObject var webRTCManager: WebRTCManager
     @EnvironmentObject var kvmDeviceManager: KVMDeviceManager
     @AppStorage("overlook.showCapturedKeys") private var showCapturedKeys = true
+    @AppStorage("overlook.hideLocalPointer") private var hideLocalPointer = false
 
     let onConnections: () -> Void
     let onSettings: () -> Void
@@ -191,6 +192,9 @@ struct CaptureSidebarView: View {
                         .toggleStyle(.switch)
                     Text(inputManager.keyboardCaptureLabel)
                         .font(.caption).fontWeight(.medium)
+                    Toggle("Hide local pointer", isOn: $hideLocalPointer)
+                        .toggleStyle(.checkbox)
+                        .help("Hide this Mac’s pointer while controlling the video. Leave it visible to see when it moves outside the video.")
                     Toggle("Invert scrolling", isOn: $inputManager.invertScrolling)
                         .toggleStyle(.checkbox)
                         .help("Reverse horizontal and vertical scrolling sent from this Mac. Remote settings stay unchanged.")

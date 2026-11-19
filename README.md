@@ -245,7 +245,7 @@ The Connections panel reports **System keyboard capture ready** once macOS actua
 
 Enable **Show captured keys** to see the currently held keys, the latest key press/release, the event count, and whether the last event came through system or app-only capture. The display is live and in memory; no key history is saved to disk.
 
-The local mouse pointer hides over the active video while mouse capture is enabled. It returns outside the video, when capture pauses, when video is unavailable, or when Overlook loses focus. OCR mode keeps the local pointer visible.
+The local pointer is visible by default so you can see when it leaves the video and mouse forwarding stops. Enable **Hide local pointer** in the sidebar to hide it over active video during mouse capture. The pointer returns outside the video, when capture pauses, when video is unavailable, or when Overlook loses focus. OCR mode keeps it visible.
 
 In this mode, `⌘C` and `⌘V` are forwarded to the remote Mac. Use the OCR toolbar control to copy text from video. Press **Control+Option+Escape** to release shortcut forwarding. Capture pauses for connection/settings panels and sheets, and held remote keys are released when capture pauses or Overlook loses focus. macOS secure input and some system-reserved keys may still prevent capture.
 

@@ -678,6 +678,13 @@ extension GLKVMClient {
         return response.result
     }
 
+    func getActiveMouseMode() async throws -> Bool? {
+        let state = try await getHidState()
+        guard case .object(let mouse) = state["mouse"],
+              case .bool(let absolute) = mouse["absolute"] else { return nil }
+        return absolute
+    }
+
     func setHidConnected(_ connected: Bool) async throws {
         _ = try await request(
             method: "POST",

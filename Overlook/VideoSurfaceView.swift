@@ -11,6 +11,7 @@ struct VideoSurfaceView: View {
     @EnvironmentObject var webRTCManager: WebRTCManager
     @EnvironmentObject var inputManager: InputManager
     @EnvironmentObject var ocrManager: OCRManager
+    @AppStorage("overlook.hideLocalPointer") private var hideLocalPointer = false
 
     @Binding var isOCRModeEnabled: Bool
     @Binding var selectedText: String
@@ -40,7 +41,7 @@ struct VideoSurfaceView: View {
                 if let videoView = webRTCManager.videoView {
                     VideoViewRepresentable(
                         videoView: videoView,
-                        hideLocalCursor: inputManager.isMouseCaptureEnabled && !isOCRModeEnabled
+                        hideLocalCursor: hideLocalPointer && inputManager.isMouseCaptureEnabled && !isOCRModeEnabled
                             && webRTCManager.isConnected && !webRTCManager.isConnecting && !webRTCManager.isStreamStalled,
                         onMouseMove: { pointInView, deltaInView in
                             guard !isOCRModeEnabled else { return }
