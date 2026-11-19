@@ -15,6 +15,32 @@ class InputManager: ObservableObject {
     private var glkvmWebSocketClient: GLKVMClient.WebSocketClient?
     private var keyEventMonitor: Any?
     private var mouseEventMonitor: Any?
+    private var shortcutEventTap: CFMachPort?
+    private var shortcutRunLoopSource: CFRunLoopSource?
+    private var shortcutTapLocation: CGEventTapLocation?
+    @Published private(set) var systemShortcutCaptureReady = false
+    private var permissionRetryTimer: Timer?
+    private var appFocusObserver: Any?
+    private var inputSendTask: Task<Void, Never>?
+    private var pressedRemoteKeys: Set<String> = []
+    private var releaseShortcutKeyUp: UInt16?
+    @Published private(set) var heldCapturedKeys = "—"
+    @Published private(set) var lastCapturedKeyEvent = "No keys captured yet"
+    @Published private(set) var capturedKeyEventCount = 0
+    @Published private(set) var lastCaptureSource = "None"
+    private var capturedKeyCodes: Set<UInt16> = []
+    @Published var lastInputError: String?
+    @Published var shortcutCaptureStatus: String?
+    @Published var forwardMacShortcuts = UserDefaults.standard.bool(forKey: "overlook.forwardMacShortcuts") {
+        didSet {
+            UserDefaults.standard.set(forwardMacShortcuts, forKey: "overlook.forwardMacShortcuts")
+            releaseRemoteKeys()
+            if forwardMacShortcuts { installShortcutCapture() } else { removeShortcutCapture() }
+        }
+    }
+    @Published var invertScrolling = UserDefaults.standard.bool(forKey: "overlook.invertScrolling") {
+        didSet { UserDefaults.standard.set(invertScrolling, forKey: "overlook.invertScrolling") }
+    }
     private var isCapturing = false
     private var mouseModeRefreshTask: Task<Void, Never>?
 
@@ -51,11 +77,19 @@ class InputManager: ObservableObject {
     
     func setup(with webRTCManager: WebRTCManager) {
         self.webRTCManager = webRTCManager
+        if appFocusObserver == nil {
+            appFocusObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.releaseRemoteKeys() }
+            }
+        }
     }
 
     func setGLKVMClient(_ client: GLKVMClient?) {
         mouseModeRefreshTask?.cancel()
         mouseModeRefreshTask = nil
+        if glkvmClient !== client { releaseRemoteKeys() }
         glkvmClient = client
         isGLKVMAbsoluteMouseMode = true
         pendingAbsoluteMouseMove = nil
@@ -196,7 +230,8 @@ class InputManager: ObservableObject {
 
     func handleVideoMouseScroll(deltaX: CGFloat, deltaY: CGFloat) {
         guard isMouseCaptureEnabled else { return }
-        let scrollEvent = MouseScrollEvent(deltaX: deltaX, deltaY: deltaY, timestamp: CACurrentMediaTime())
+        let direction: CGFloat = invertScrolling ? -1 : 1
+        let scrollEvent = MouseScrollEvent(deltaX: deltaX * direction, deltaY: deltaY * direction, timestamp: CACurrentMediaTime())
         sendMouseScrollEvent(scrollEvent)
     }
 
@@ -214,15 +249,19 @@ class InputManager: ObservableObject {
     }
 
     func disconnectGLKVMWebSocket() {
+        releaseRemoteKeys()
         stopMouseMoveSender()
         let ws = glkvmWebSocketClient
         glkvmWebSocketClient = nil
-        Task {
+        let previous = inputSendTask
+        inputSendTask = Task {
+            await previous?.value
             await ws?.disconnect()
         }
     }
     
     func startKeyboardCapture() {
+        if forwardMacShortcuts { installShortcutCapture() }
         guard keyEventMonitor == nil else {
             isCapturing = true
             isKeyboardCaptureEnabled = true
@@ -233,13 +272,15 @@ class InputManager: ObservableObject {
         isKeyboardCaptureEnabled = true
         
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
-            self?.handleKeyEvent(event)
-            guard let self, self.isKeyboardCaptureEnabled else { return event }
+            guard let self, self.isKeyboardCaptureEnabled,
+                  NSApp.keyWindow?.attachedSheet == nil else { return event }
+            self.handleKeyEvent(event)
             return nil
         }
     }
     
     func stopKeyboardCapture() {
+        releaseRemoteKeys()
         isKeyboardCaptureEnabled = false
         
         if let monitor = keyEventMonitor {
@@ -270,8 +311,220 @@ class InputManager: ObservableObject {
         }
     }
     
-    private func handleKeyEvent(_ event: NSEvent) {
+    // Runs on the main run loop so deciding whether to swallow an event is synchronous.
+    private func installShortcutCapture(requestPermission: Bool = true) {
+        if let tap = shortcutEventTap {
+            systemShortcutCaptureReady = CGEvent.tapIsEnabled(tap: tap)
+            return
+        }
+        let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue)
+            | (CGEventMask(1) << CGEventType.keyUp.rawValue)
+            | (CGEventMask(1) << CGEventType.flagsChanged.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, context in
+            guard let context else { return Unmanaged.passUnretained(event) }
+            return MainActor.assumeIsolated {
+                let manager = Unmanaged<InputManager>.fromOpaque(context).takeUnretainedValue()
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    manager.releaseRemoteKeys()
+                    if let tap = manager.shortcutEventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+                    return Unmanaged.passUnretained(event)
+                }
+                guard manager.forwardMacShortcuts, manager.isKeyboardCaptureEnabled,
+                      NSApp.isActive, NSApp.keyWindow?.attachedSheet == nil,
+                      manager.glkvmClient != nil,
+                      let keyEvent = NSEvent(cgEvent: event) else {
+                    return Unmanaged.passUnretained(event)
+                }
+                manager.handleKeyEvent(keyEvent, fromSystemTap: true)
+                return nil
+            }
+        }
+        // Prefer the earliest supported event stream, before system shortcuts.
+        // Some configurations permit only a session tap, so keep that fallback.
+        var createdTap: CFMachPort?
+        for location in [CGEventTapLocation.cghidEventTap, .cgSessionEventTap] {
+            if let tap = CGEvent.tapCreate(tap: location, place: .headInsertEventTap,
+                                          options: .defaultTap, eventsOfInterest: mask,
+                                          callback: callback, userInfo: Unmanaged.passUnretained(self).toOpaque()) {
+                createdTap = tap
+                shortcutTapLocation = location
+                break
+            }
+        }
+        guard let tap = createdTap else {
+            systemShortcutCaptureReady = false
+            shortcutCaptureStatus = "System capture blocked. Open Privacy & Security → Device Control and Data Access (Accessibility on older macOS). Remove the old Overlook entry and add /Applications/Overlook.app again."
+            if requestPermission { requestAccessibilityPermissions() }
+            if permissionRetryTimer == nil {
+                permissionRetryTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self, self.forwardMacShortcuts else { return }
+                        self.installShortcutCapture(requestPermission: false)
+                    }
+                }
+            }
+            return
+        }
+        permissionRetryTimer?.invalidate()
+        permissionRetryTimer = nil
+        shortcutEventTap = tap
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        shortcutRunLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        systemShortcutCaptureReady = CGEvent.tapIsEnabled(tap: tap)
+        shortcutCaptureStatus = systemShortcutCaptureReady ? "System keyboard capture ready." : "System keyboard capture could not be enabled."
+    }
+
+    private func removeShortcutCapture() {
+        permissionRetryTimer?.invalidate()
+        permissionRetryTimer = nil
+        if let source = shortcutRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        if let tap = shortcutEventTap { CFMachPortInvalidate(tap) }
+        shortcutEventTap = nil
+        shortcutRunLoopSource = nil
+        shortcutTapLocation = nil
+        systemShortcutCaptureReady = false
+        shortcutCaptureStatus = nil
+    }
+
+    func recheckShortcutAccess() {
+        removeShortcutCapture()
+        if forwardMacShortcuts { installShortcutCapture() }
+    }
+
+    func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    var keyboardCaptureLabel: String {
+        guard isKeyboardCaptureEnabled else { return "Keyboard paused" }
+        if forwardMacShortcuts {
+            return systemShortcutCaptureReady ? "System capture ready" : "App-only capture · system access blocked"
+        }
+        return "App-only capture"
+    }
+
+    private func noteCapturedKey(_ event: NSEvent, fromSystemTap: Bool) {
+        guard [.keyDown, .keyUp, .flagsChanged].contains(event.type) else { return }
+        let code = event.keyCode
+        let isDown: Bool
+        if event.type == .flagsChanged {
+            let masks: [UInt16: UInt] = [59: 0x1, 56: 0x2, 60: 0x4, 55: 0x8,
+                                          54: 0x10, 58: 0x20, 61: 0x40, 62: 0x2000]
+            if code == 57 { isDown = event.modifierFlags.contains(.capsLock) }
+            else if let mask = masks[code] { isDown = event.modifierFlags.rawValue & mask != 0 }
+            else { return }
+        } else { isDown = event.type == .keyDown }
+        if isDown { capturedKeyCodes.insert(code) }
+        let chord = capturedChord(capturedKeyCodes.union([code]))
+        if !isDown { capturedKeyCodes.remove(code) }
+        heldCapturedKeys = capturedChord(capturedKeyCodes)
+        lastCapturedKeyEvent = chord + (isDown ? " ↓" : " ↑")
+        lastCaptureSource = fromSystemTap ? "System" : "App"
+        capturedKeyEventCount += 1
+    }
+
+    private func capturedChord(_ codes: Set<UInt16>) -> String {
+        guard !codes.isEmpty else { return "—" }
+        let order: [UInt16] = [59, 62, 58, 61, 56, 60, 55, 54]
+        let symbols: [UInt16: String] = [59: "⌃", 62: "⌃R", 58: "⌥", 61: "⌥R",
+                                         56: "⇧", 60: "⇧R", 55: "⌘", 54: "⌘R", 57: "⇪",
+                                         48: "Tab", 49: "Space", 53: "Esc", 36: "Return",
+                                         123: "←", 124: "→", 125: "↓", 126: "↑"]
+        return codes.sorted {
+            let left = order.firstIndex(of: $0) ?? 100 + Int($0)
+            let right = order.firstIndex(of: $1) ?? 100 + Int($1)
+            return left < right
+        }.map { code in
+            if let symbol = symbols[code] { return symbol }
+            guard let key = glkvmKeyForMacKeyCode(code) else { return "Key \(code)" }
+            if key.hasPrefix("Key") { return String(key.dropFirst(3)) }
+            if key.hasPrefix("Digit") { return String(key.dropFirst(5)) }
+            return key
+        }.joined(separator: " ")
+    }
+
+    private func forwardCapturedKey(_ event: NSEvent) {
+        // Control+Option+Escape is always local and releases every remote key.
+        if event.type == .keyUp, releaseShortcutKeyUp == event.keyCode {
+            releaseShortcutKeyUp = nil
+            return
+        }
+        if event.type == .keyDown, event.keyCode == 53,
+           event.modifierFlags.contains([.control, .option]) {
+            releaseShortcutKeyUp = event.keyCode
+            forwardMacShortcuts = false
+            return
+        }
+        let isDown: Bool
+        switch event.type {
+        case .keyDown: isDown = true
+        case .keyUp: isDown = false
+        case .flagsChanged:
+            if event.keyCode == 57 { // Caps Lock is a toggle, rather than a held modifier.
+                sendKeyEvent(KeyEvent(keyCode: 57, isKeyDown: true, modifiers: [], timestamp: event.timestamp))
+                sendKeyEvent(KeyEvent(keyCode: 57, isKeyDown: false, modifiers: [], timestamp: event.timestamp))
+                return
+            }
+            // Device-specific modifier bits preserve left/right key releases even
+            // when both sides of a modifier are held (IOKit/IOLLEvent.h).
+            let masks: [UInt16: UInt] = [59: 0x1, 56: 0x2, 60: 0x4, 55: 0x8,
+                                          54: 0x10, 58: 0x20, 61: 0x40, 62: 0x2000]
+            guard let mask = masks[event.keyCode] else { return }
+            isDown = event.modifierFlags.rawValue & mask != 0
+        default: return
+        }
+        sendKeyEvent(KeyEvent(keyCode: event.keyCode, isKeyDown: isDown,
+                              modifiers: event.modifierFlags, timestamp: event.timestamp))
+    }
+
+    private func queueHidKey(_ key: String, isDown: Bool, through ws: GLKVMClient.WebSocketClient) {
+        if isDown { pressedRemoteKeys.insert(key) } else { pressedRemoteKeys.remove(key) }
+        let previous = inputSendTask
+        inputSendTask = Task { [weak self] in
+            await previous?.value
+            do { try await ws.sendHidKey(key: key, state: isDown) }
+            catch { self?.lastInputError = "Keyboard input failed: \(error.localizedDescription)" }
+        }
+    }
+
+    private func releaseRemoteKeys() {
+        if let ws = glkvmWebSocketClient {
+            // Release ordinary keys first, then modifiers.
+            let modifiers: Set<String> = ["MetaLeft", "MetaRight", "AltLeft", "AltRight", "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight"]
+            let keys = pressedRemoteKeys.sorted { modifiers.contains($0) == modifiers.contains($1) ? $0 < $1 : !modifiers.contains($0) }
+            for key in keys { queueHidKey(key, isDown: false, through: ws) }
+        }
+        pressedRemoteKeys.removeAll()
+        capturedKeyCodes.removeAll()
+        heldCapturedKeys = "—"
+        clearPendingCommandKey()
+    }
+
+    func wakeHost() async throws {
+        guard let client = glkvmClient else { throw GLKVMClient.WebSocketClient.WebSocketError.notConnected }
+        // Use the authenticated HTTP HID API, independently of video and keyboard capture.
+        try await client.sendHidKey(key: "ShiftLeft", state: true)
+        do { try await Task.sleep(for: .milliseconds(100)) }
+        catch {
+            try? await client.sendHidKey(key: "ShiftLeft", state: false)
+            throw error
+        }
+        try await client.sendHidKey(key: "ShiftLeft", state: false)
+    }
+
+    private func handleKeyEvent(_ event: NSEvent, fromSystemTap: Bool = false) {
         guard isKeyboardCaptureEnabled else { return }
+        noteCapturedKey(event, fromSystemTap: fromSystemTap)
+        if forwardMacShortcuts {
+            forwardCapturedKey(event)
+            return
+        }
 
         switch event.type {
         case .keyDown, .keyUp:
@@ -308,10 +561,8 @@ class InputManager: ObservableObject {
                     pendingCommandKeyCode = nil
                     commandKeySentToRemote = true
 
-                    Task {
-                        try? await ws.sendHidKey(key: metaKey, state: true)
-                        try? await ws.sendHidKey(key: keyName, state: true)
-                    }
+                    queueHidKey(metaKey, isDown: true, through: ws)
+                    queueHidKey(keyName, isDown: true, through: ws)
                     return
                 }
 
@@ -386,9 +637,7 @@ class InputManager: ObservableObject {
            let ws = glkvmWebSocketClient,
            let code = activeCommandKeyCode,
            let metaKey = glkvmKeyForMacKeyCode(code) {
-            Task {
-                try? await ws.sendHidKey(key: metaKey, state: false)
-            }
+            queueHidKey(metaKey, isDown: false, through: ws)
         }
 
         pendingCommandKeyCode = activeCommandKeyCode ?? pendingCommandKeyCode
@@ -496,12 +745,13 @@ class InputManager: ObservableObject {
     }
     
     private func sendKeyEvent(_ event: KeyEvent) {
-        if transportMode == .glkvmWebSocket,
-           let key = glkvmKeyForMacKeyCode(event.keyCode),
-           let ws = glkvmWebSocketClient {
-            Task {
-                try? await ws.sendHidKey(key: key, state: event.isKeyDown)
+        if transportMode == .glkvmWebSocket {
+            guard let key = glkvmKeyForMacKeyCode(event.keyCode) else { return }
+            guard let ws = glkvmWebSocketClient else {
+                lastInputError = "Keyboard connection is not ready. Try reconnecting."
+                return
             }
+            queueHidKey(key, isDown: event.isKeyDown, through: ws)
             return
         }
 
@@ -584,8 +834,11 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket, let ws = glkvmWebSocketClient {
             let dx = Self.clampInt(Int(event.deltaX.rounded()), min: -127, max: 127)
             let dy = Self.clampInt(Int(event.deltaY.rounded()), min: -127, max: 127)
-            Task {
-                try? await ws.sendHidMouseWheel(deltaX: dx, deltaY: dy)
+            let previous = inputSendTask
+            inputSendTask = Task { [weak self] in
+                await previous?.value
+                do { try await ws.sendHidMouseWheel(deltaX: dx, deltaY: dy) }
+                catch { self?.lastInputError = "Scroll input failed: \(error.localizedDescription)" }
             }
             return
         }
@@ -697,6 +950,10 @@ class InputManager: ObservableObject {
     }
     
     deinit {
+        permissionRetryTimer?.invalidate()
+        if let observer = appFocusObserver { NotificationCenter.default.removeObserver(observer) }
+        if let source = shortcutRunLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        if let tap = shortcutEventTap { CFMachPortInvalidate(tap) }
         if let monitor = keyEventMonitor {
             NSEvent.removeMonitor(monitor)
             keyEventMonitor = nil

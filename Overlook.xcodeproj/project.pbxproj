@@ -29,6 +29,7 @@
 		0100001D /* CoreAudioDevices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200001C /* CoreAudioDevices.swift */; };
 		0100001E /* WebRTCAudioDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200001D /* WebRTCAudioDevice.swift */; };
 		0100001F /* WebRTCFactoryBuilder.m in Sources */ = {isa = PBXBuildFile; fileRef = 02000021 /* WebRTCFactoryBuilder.m */; };
+		01000022 /* WindowGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000022 /* WindowGeometry.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -58,6 +59,7 @@
 		02000020 /* WebRTCFactoryBuilder.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WebRTCFactoryBuilder.h; sourceTree = "<group>"; };
 		02000021 /* WebRTCFactoryBuilder.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WebRTCFactoryBuilder.m; sourceTree = "<group>"; };
 		03000001 /* Overlook.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Overlook.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		02000022 /* WindowGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowGeometry.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -85,6 +87,7 @@
 			children = (
 				02000001 /* OverlookApp.swift */,
 				02000002 /* ContentView.swift */,
+				02000022 /* WindowGeometry.swift */,
 				02000019 /* ContentControlBar.swift */,
 				0200001A /* VideoSurfaceView.swift */,
 				0200001B /* StatusBarView.swift */,
@@ -198,6 +201,7 @@
 			files = (
 				01000001 /* OverlookApp.swift in Sources */,
 				01000002 /* ContentView.swift in Sources */,
+				01000022 /* WindowGeometry.swift in Sources */,
 				0100001A /* ContentControlBar.swift in Sources */,
 				0100001B /* VideoSurfaceView.swift in Sources */,
 				0100001C /* StatusBarView.swift in Sources */,
@@ -359,6 +363,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Overlook/Info.plist;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Overlook needs microphone access to send audio to the remote device.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -394,6 +399,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Overlook/Info.plist;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Overlook needs microphone access to send audio to the remote device.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (

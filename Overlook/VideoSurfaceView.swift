@@ -40,6 +40,8 @@ struct VideoSurfaceView: View {
                 if let videoView = webRTCManager.videoView {
                     VideoViewRepresentable(
                         videoView: videoView,
+                        hideLocalCursor: inputManager.isMouseCaptureEnabled && !isOCRModeEnabled
+                            && webRTCManager.isConnected && !webRTCManager.isConnecting && !webRTCManager.isStreamStalled,
                         onMouseMove: { pointInView, deltaInView in
                             guard !isOCRModeEnabled else { return }
                             inputManager.handleVideoMouseMove(
@@ -129,6 +131,8 @@ struct VideoSurfaceView: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
+
+                        WakeHostButton()
 
                         Button("Reconnect") {
                             onReconnect()
@@ -256,12 +260,14 @@ struct VideoSurfaceView: View {
 #if canImport(WebRTC)
 struct VideoViewRepresentable: NSViewRepresentable {
     let videoView: RTCMTLNSVideoView
+    let hideLocalCursor: Bool
     let onMouseMove: (CGPoint, CGSize) -> Void
     let onMouseButton: (MouseButton, Bool, CGPoint) -> Void
     let onScrollWheel: (CGFloat, CGFloat) -> Void
 
     func makeNSView(context: Context) -> TrackingContainerView {
         let container = TrackingContainerView()
+        container.shouldHideLocalCursor = hideLocalCursor
         container.onMouseMove = onMouseMove
         container.onMouseButton = onMouseButton
         container.onScrollWheel = onScrollWheel
@@ -270,10 +276,15 @@ struct VideoViewRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: TrackingContainerView, context: Context) {
+        nsView.shouldHideLocalCursor = hideLocalCursor
         nsView.onMouseMove = onMouseMove
         nsView.onMouseButton = onMouseButton
         nsView.onScrollWheel = onScrollWheel
         nsView.embedVideoViewIfNeeded(videoView)
+    }
+
+    static func dismantleNSView(_ nsView: TrackingContainerView, coordinator: ()) {
+        nsView.shouldHideLocalCursor = false
     }
 }
 
@@ -282,6 +293,11 @@ final class TrackingContainerView: NSView {
     var onMouseButton: ((MouseButton, Bool, CGPoint) -> Void)?
     var onScrollWheel: ((CGFloat, CGFloat) -> Void)?
 
+    var shouldHideLocalCursor = false {
+        didSet { updateCursorVisibility() }
+    }
+    private var isLocalCursorHidden = false
+    private var focusObservers: [NSObjectProtocol] = []
     private var trackingAreaRef: NSTrackingArea?
 
     private weak var embeddedVideoView: RTCMTLNSVideoView?
@@ -290,11 +306,49 @@ final class TrackingContainerView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        observeFocusChanges()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         wantsLayer = true
+        observeFocusChanges()
+    }
+
+    private func observeFocusChanges() {
+        for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification,
+                     NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            focusObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateCursorVisibility() }
+            })
+        }
+    }
+
+    private func updateCursorVisibility() {
+        let point = window.map { convert($0.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil) }
+        let shouldHide = shouldHideLocalCursor && NSApp.isActive && window?.isKeyWindow == true
+            && point.map { bounds.contains($0) } == true
+        guard shouldHide != isLocalCursorHidden else { return }
+        if shouldHide { NSCursor.hide() } else { NSCursor.unhide() }
+        isLocalCursorHidden = shouldHide
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        updateCursorVisibility()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if isLocalCursorHidden {
+            NSCursor.unhide()
+            isLocalCursorHidden = false
+        }
+    }
+
+    deinit {
+        for observer in focusObservers { NotificationCenter.default.removeObserver(observer) }
+        if isLocalCursorHidden { NSCursor.unhide() }
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -304,6 +358,7 @@ final class TrackingContainerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        updateCursorVisibility()
     }
 
     override func updateTrackingAreas() {
@@ -317,10 +372,12 @@ final class TrackingContainerView: NSView {
             .activeInKeyWindow,
             .inVisibleRect,
             .mouseMoved,
+            .mouseEnteredAndExited,
         ]
         let area = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
         addTrackingArea(area)
         trackingAreaRef = area
+        updateCursorVisibility()
     }
 
     func embedVideoViewIfNeeded(_ videoView: RTCMTLNSVideoView) {
@@ -349,6 +406,7 @@ final class TrackingContainerView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
+        updateCursorVisibility()
         emitMouseMove(with: event)
     }
 

@@ -46,9 +46,11 @@ struct InputEvent: Codable {
 class WebRTCManager: NSObject, ObservableObject {
     private final class SessionDelegate: NSObject, URLSessionDelegate {
         let allowInsecureTLS: Bool
+        let expectedHost: String
 
-        init(allowInsecureTLS: Bool) {
+        init(allowInsecureTLS: Bool, expectedHost: String) {
             self.allowInsecureTLS = allowInsecureTLS
+            self.expectedHost = expectedHost.lowercased()
         }
 
         func urlSession(
@@ -57,6 +59,7 @@ class WebRTCManager: NSObject, ObservableObject {
             completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
         ) {
             guard allowInsecureTLS,
+                  challenge.protectionSpace.host.lowercased() == expectedHost,
                   challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
                   let trust = challenge.protectionSpace.serverTrust else {
                 completionHandler(.performDefaultHandling, nil)
@@ -141,10 +144,10 @@ class WebRTCManager: NSObject, ObservableObject {
     private let streamStallThresholdSeconds: CFTimeInterval = 3.0
     private let initialFrameTimeoutSeconds: CFTimeInterval = 5.0
     
-    private let allowInsecureTLS = true
     private var signalingSession: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
 
+    private var janusWatchRetryTasks: [Int: Task<Void, Never>] = [:]
     private var janusSessionId: Int?
     private var janusHandleId: Int?
     private var janusAudioHandleId: Int?
@@ -438,7 +441,7 @@ class WebRTCManager: NSObject, ObservableObject {
         print("WebRTC signaling connect: \(url.absoluteString)")
 
         let config = URLSessionConfiguration.default
-        let session = URLSession(configuration: config, delegate: SessionDelegate(allowInsecureTLS: allowInsecureTLS), delegateQueue: nil)
+        let session = URLSession(configuration: config, delegate: SessionDelegate(allowInsecureTLS: DeviceTLSPolicy.allowsUntrustedCertificate(for: device.host), expectedHost: url.host ?? device.host), delegateQueue: nil)
         signalingSession = session
 
         var request = URLRequest(url: url)
@@ -486,24 +489,8 @@ class WebRTCManager: NSObject, ObservableObject {
         }
         janusHandleId = handleId
 
-        // Video handle always requests video-only to avoid A/V sync causing video buffering.
-        let watchTransaction = makeJanusTransaction()
-        try await sendJanusMessage([
-            "janus": "message",
-            "body": [
-                "request": "watch",
-                "params": [
-                    "orientation": 0,
-                    "audio": false,
-                    "video": true,
-                    "mic": false,
-                    "camera": false,
-                ],
-            ],
-            "transaction": watchTransaction,
-            "session_id": sessionId,
-            "handle_id": handleId,
-        ])
+        // Video and audio use separate handles to avoid A/V sync buffering.
+        try await sendWatchRequest(handleId: handleId)
 
         if (audioEnabled || micEnabled), let audioPeerConnection {
             let audioAttachTransaction = makeJanusTransaction()
@@ -522,28 +509,56 @@ class WebRTCManager: NSObject, ObservableObject {
             }
             janusAudioHandleId = audioHandleId
 
-            let audioWatchTransaction = makeJanusTransaction()
-            try await sendJanusMessage([
-                "janus": "message",
-                "body": [
-                    "request": "watch",
-                    "params": [
-                        "orientation": 0,
-                        "audio": audioEnabled,
-                        "video": false,
-                        "mic": micEnabled,
-                        "camera": false,
-                    ],
-                ],
-                "transaction": audioWatchTransaction,
-                "session_id": sessionId,
-                "handle_id": audioHandleId,
-            ])
+            try await sendWatchRequest(handleId: audioHandleId)
 
             _ = audioPeerConnection
         }
 
         startJanusKeepAlive()
+    }
+
+    private func sendWatchRequest(handleId: Int) async throws {
+        guard let sessionId = janusSessionId else { return }
+        let isAudio = handleId == janusAudioHandleId
+        try await sendJanusMessage([
+            "janus": "message",
+            "body": [
+                "request": "watch",
+                "params": [
+                    "orientation": 0,
+                    "audio": isAudio && audioEnabled,
+                    "video": !isAudio,
+                    "mic": isAudio && micEnabled,
+                    "camera": false,
+                ],
+            ],
+            "transaction": makeJanusTransaction(),
+            "session_id": sessionId,
+            "handle_id": handleId,
+        ])
+    }
+
+    private func retryWatchRequest(handleId: Int) {
+        guard janusWatchRetryTasks[handleId] == nil else { return }
+        let sessionId = janusSessionId
+        janusWatchRetryTasks[handleId] = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            guard let self, self.janusSessionId == sessionId,
+                  handleId == self.janusHandleId || handleId == self.janusAudioHandleId else { return }
+            self.janusWatchRetryTasks[handleId] = nil
+            do {
+                if let sessionId {
+                    try await self.sendJanusMessage([
+                        "janus": "message", "body": ["request": "stop"],
+                        "transaction": self.makeJanusTransaction(),
+                        "session_id": sessionId, "handle_id": handleId,
+                    ])
+                }
+                try await self.sendWatchRequest(handleId: handleId)
+            } catch {
+                self.lastDisconnectReason = "Could not restart video: \(error.localizedDescription)"
+            }
+        }
     }
 
     private func startJanusKeepAlive() {
@@ -718,6 +733,16 @@ class WebRTCManager: NSObject, ObservableObject {
         if janusType != "event" { return }
 
         let senderHandleId = message["sender"] as? Int
+        if let pluginData = message["plugindata"] as? [String: Any],
+           let data = pluginData["data"] as? [String: Any],
+           data["error_code"] != nil || data["error"] != nil,
+           let handleId = senderHandleId {
+            if handleId == janusHandleId {
+                lastDisconnectReason = (data["error"] as? String) ?? "Waiting for video signal. Try Wake display."
+            }
+            retryWatchRequest(handleId: handleId)
+            return
+        }
         guard let jsep = message["jsep"] as? [String: Any],
               let jsepType = jsep["type"] as? String,
               jsepType == "offer",
@@ -725,6 +750,9 @@ class WebRTCManager: NSObject, ObservableObject {
             return
         }
 
+        if let handleId = senderHandleId ?? janusHandleId {
+            janusWatchRetryTasks.removeValue(forKey: handleId)?.cancel()
+        }
         await handleOfferSDP(sdpString, senderHandleId: senderHandleId)
     }
     
@@ -1183,6 +1211,8 @@ class WebRTCManager: NSObject, ObservableObject {
     }
     
     func disconnect() {
+        for task in janusWatchRetryTasks.values { task.cancel() }
+        janusWatchRetryTasks.removeAll()
         connectionTimer?.invalidate()
         connectionTimer = nil
 

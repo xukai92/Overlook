@@ -651,7 +651,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             finalDevice = device
         }
 
-        guard let client = try? GLKVMClient(device: finalDevice, allowInsecureTLS: true) else {
+        guard let client = try? GLKVMClient(device: finalDevice) else {
             throw KVMError.connectionFailed
         }
 

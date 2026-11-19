@@ -2,6 +2,8 @@ import SwiftUI
 import Foundation
 import AppKit
 
+private let captureSidebarWidth: CGFloat = 272
+
 struct ContentView: View {
     @EnvironmentObject var webRTCManager: WebRTCManager
     @EnvironmentObject var inputManager: InputManager
@@ -31,8 +33,6 @@ struct ContentView: View {
     @State private var showingConnections = false
     @State private var didAutoOpenConnections = false
 
-    @State private var pausedCaptureKeyboardWasEnabled: Bool?
-    @State private var pausedCaptureMouseWasEnabled: Bool?
     @State private var isInputCapturePausedForUI: Bool = false
 
     @State private var windowRef: NSWindow?
@@ -40,6 +40,28 @@ struct ContentView: View {
     @State private var isFullscreen: Bool = false
     @State private var showFullscreenControls: Bool = false
     @State private var fullscreenHoverTask: Task<Void, Never>?
+
+    @AppStorage("overlook.captureSidebarVisible") private var isCaptureSidebarVisible = true
+
+    @State private var pendingSidebarTarget: NSRect?
+    @State private var sidebarResizeRevision = 0
+
+    private var visibleSidebarWidth: CGFloat { isCaptureSidebarVisible ? captureSidebarWidth + 1 : 0 }
+
+    private var sidebarToggleButton: some View {
+        Button {
+            setCaptureSidebarVisible(!isCaptureSidebarVisible)
+        } label: {
+            Label(isCaptureSidebarVisible ? "Hide sidebar" : "Show sidebar", systemImage: "sidebar.right")
+        }
+        .help(isCaptureSidebarVisible ? "Hide sidebar" : "Show sidebar")
+    }
+
+    private var nativeSizeButton: some View {
+        Button("Native size") { fitWindowToGuest(mode: .nativeResolution) }
+            .disabled(webRTCManager.videoSize == nil)
+            .help("Size the video area to the remote resolution in macOS points, without scaling it down.")
+    }
 
     @AppStorage("overlook.appAppearance") private var appAppearance: String = "system"
 
@@ -111,167 +133,186 @@ struct ContentView: View {
     }
     
     var body: some View {
-        ZStack(alignment: .trailing) {
-            if isFullscreen {
-                VideoSurfaceView(
-                    isOCRModeEnabled: $isOCRModeEnabled,
-                    selectedText: $selectedText,
-                    isShowingOCRResult: $isShowingOCRResult,
-                    onReconnect: {
-                        guard let device = kvmDeviceManager.connectedDevice else { return }
-                        Task { @MainActor in
-                            await webRTCManager.reconnect(to: device)
+        HStack(spacing: 0) {
+            ZStack(alignment: .trailing) {
+                if isFullscreen {
+                    VideoSurfaceView(
+                        isOCRModeEnabled: $isOCRModeEnabled,
+                        selectedText: $selectedText,
+                        isShowingOCRResult: $isShowingOCRResult,
+                        onReconnect: {
+                            guard let device = kvmDeviceManager.connectedDevice else { return }
+                            Task { @MainActor in
+                                await webRTCManager.reconnect(to: device)
+                            }
                         }
-                    }
-                )
-                .ignoresSafeArea()
-                .allowsHitTesting(!showingSettings)
-            } else {
-                VideoSurfaceView(
-                    isOCRModeEnabled: $isOCRModeEnabled,
-                    selectedText: $selectedText,
-                    isShowingOCRResult: $isShowingOCRResult,
-                    onReconnect: {
-                        guard let device = kvmDeviceManager.connectedDevice else { return }
-                        Task { @MainActor in
-                            await webRTCManager.reconnect(to: device)
+                    )
+                    .ignoresSafeArea()
+                    .allowsHitTesting(!showingSettings)
+                } else {
+                    VideoSurfaceView(
+                        isOCRModeEnabled: $isOCRModeEnabled,
+                        selectedText: $selectedText,
+                        isShowingOCRResult: $isShowingOCRResult,
+                        onReconnect: {
+                            guard let device = kvmDeviceManager.connectedDevice else { return }
+                            Task { @MainActor in
+                                await webRTCManager.reconnect(to: device)
+                            }
                         }
-                    }
-                )
-                .allowsHitTesting(!showingSettings)
-            }
+                    )
+                    .allowsHitTesting(!showingSettings)
+                }
 
-            if isFullscreen && !showingSettings && !showingConnections {
-                VStack(spacing: 0) {
-                    Color.clear
-                        .frame(height: 28)
-                        .frame(maxWidth: .infinity)
-                        .contentShape(Rectangle())
-                        .onHover { hovering in
-                            fullscreenHoverTask?.cancel()
-                            if hovering {
-                                fullscreenHoverTask = Task { @MainActor in
-                                    try? await Task.sleep(nanoseconds: 350_000_000)
-                                    if isFullscreen {
-                                        withAnimation(.easeInOut(duration: 0.15)) {
-                                            showFullscreenControls = true
+                if isFullscreen && !showingSettings && !showingConnections {
+                    VStack(spacing: 0) {
+                        Color.clear
+                            .frame(height: 28)
+                            .frame(maxWidth: .infinity)
+                            .contentShape(Rectangle())
+                            .onHover { hovering in
+                                fullscreenHoverTask?.cancel()
+                                if hovering {
+                                    fullscreenHoverTask = Task { @MainActor in
+                                        try? await Task.sleep(nanoseconds: 350_000_000)
+                                        if isFullscreen {
+                                            withAnimation(.easeInOut(duration: 0.15)) {
+                                                showFullscreenControls = true
+                                            }
                                         }
                                     }
-                                }
-                            } else {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    showFullscreenControls = false
+                                } else {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        showFullscreenControls = false
+                                    }
                                 }
                             }
+
+                        if showFullscreenControls {
+                            HStack(spacing: 10) {
+                                Button(action: { showingConnections.toggle() }) {
+                                    Image(systemName: "personalhotspot")
+                                }
+                                .help("Connections")
+
+                                sidebarToggleButton
+                                nativeSizeButton
+                                WakeHostButton()
+
+                                Button(action: { fitWindowToGuest() }) {
+                                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                }
+                                .disabled(webRTCManager.videoSize == nil)
+                                .help("Fit video to this screen")
+
+                                Button(action: { toggleOCR() }) {
+                                    Image(systemName: isOCRModeEnabled ? "text.viewfinder" : "doc.text")
+                                }
+                                .disabled(!isConnected)
+                                .help(isOCRModeEnabled ? "Disable OCR Selection" : "Enable OCR Selection")
+
+                                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
+                                    Image(systemName: "gearshape")
+                                }
+                                .disabled(!isConnected)
+                                .help("Settings")
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .padding(.top, 6)
+                            .padding(.leading, 12)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .transition(.opacity)
                         }
 
-                    if showFullscreenControls {
-                        HStack(spacing: 10) {
-                            Button(action: { showingConnections.toggle() }) {
-                                Image(systemName: "personalhotspot")
-                            }
-                            .help("Connections")
-
-                            Button(action: { fitWindowToGuest() }) {
-                                Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            }
-                            .disabled(webRTCManager.videoSize == nil)
-                            .help("Fit window to guest")
-
-                            Button(action: { toggleOCR() }) {
-                                Image(systemName: isOCRModeEnabled ? "text.viewfinder" : "doc.text")
-                            }
-                            .disabled(!isConnected)
-                            .help(isOCRModeEnabled ? "Disable OCR Selection" : "Enable OCR Selection")
-
-                            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
-                                Image(systemName: "gearshape")
-                            }
-                            .disabled(!isConnected)
-                            .help("Settings")
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.ultraThinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                        .padding(.top, 6)
-                        .padding(.leading, 12)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .transition(.opacity)
+                        Spacer(minLength: 0)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                if showingSettings || showingConnections {
+                    Color.black.opacity(0.18)
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                showingSettings = false
+                                showingConnections = false
+                            }
+                        }
+                }
+
+                WebUISettingsPanel(isPresented: $showingSettings)
+                    .frame(width: 360)
+                    .offset(x: showingSettings ? 0 : 360)
+                    .animation(Animation.easeInOut(duration: 0.2), value: showingSettings)
+                    .allowsHitTesting(showingSettings)
+
+                VStack(spacing: 0) {
+                    ConnectionsPopoverView(
+                        selectedDevice: $selectedDevice,
+                        isConnected: isConnected,
+                        isScanning: kvmDeviceManager.isScanning,
+                        devices: kvmDeviceManager.availableDevices,
+                        connectedDeviceName: kvmDeviceManager.connectedDevice?.name,
+                        latency: webRTCManager.latency,
+                        videoSize: webRTCManager.videoSize,
+                        inboundVideoKbps: webRTCManager.inboundVideoKbps,
+                        inboundFps: webRTCManager.inboundFps,
+                        inboundVideoPlayoutDelayMs: webRTCManager.inboundVideoPlayoutDelayMs,
+                        inboundVideoJitterMs: webRTCManager.inboundVideoJitterMs,
+                        inboundVideoDecodeMs: webRTCManager.inboundVideoDecodeMs,
+                        inboundVideoPacketsLost: webRTCManager.inboundVideoPacketsLost,
+                        iceCurrentRoundTripTimeMs: webRTCManager.iceCurrentRoundTripTimeMs,
+                        inboundAudioKbps: webRTCManager.inboundAudioKbps,
+                        inboundAudioPlayoutDelayMs: webRTCManager.inboundAudioPlayoutDelayMs,
+                        inboundAudioJitterMs: webRTCManager.inboundAudioJitterMs,
+                        inboundAudioPacketsLost: webRTCManager.inboundAudioPacketsLost,
+                        audioIceCurrentRoundTripTimeMs: webRTCManager.audioIceCurrentRoundTripTimeMs,
+                        onScan: {
+                            kvmDeviceManager.scanForDevices()
+                        },
+                        onManualConnect: {
+                            showingManualConnect = true
+                        },
+                        onToggleConnection: {
+                            toggleConnection()
+                        },
+                        onForgetSelectedDevice: {
+                            guard let device = selectedDevice else { return }
+                            guard device.id.hasPrefix("saved-") else { return }
+                            kvmDeviceManager.forgetDevice(device)
+                            selectedDevice = nil
+                        }
+                    )
+                    .frame(width: 360)
+                    .background(.ultraThinMaterial)
+                    .padding(.top, 8)
 
                     Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxHeight: .infinity)
+                .offset(x: showingConnections ? 0 : 360)
+                .animation(.easeInOut(duration: 0.2), value: showingConnections)
+                .allowsHitTesting(showingConnections)
             }
-
-            if showingSettings || showingConnections {
-                Color.black.opacity(0.18)
-                    .ignoresSafeArea()
-                    .transition(.opacity)
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showingSettings = false
-                            showingConnections = false
-                        }
-                    }
-            }
-
-            WebUISettingsPanel(isPresented: $showingSettings)
-                .frame(width: 360)
-                .offset(x: showingSettings ? 0 : 360)
-                .animation(Animation.easeInOut(duration: 0.2), value: showingSettings)
-                .allowsHitTesting(showingSettings)
-
-            VStack(spacing: 0) {
-                ConnectionsPopoverView(
-                    selectedDevice: $selectedDevice,
-                    isConnected: isConnected,
-                    isScanning: kvmDeviceManager.isScanning,
-                    devices: kvmDeviceManager.availableDevices,
-                    connectedDeviceName: kvmDeviceManager.connectedDevice?.name,
-                    latency: webRTCManager.latency,
-                    videoSize: webRTCManager.videoSize,
-                    inboundVideoKbps: webRTCManager.inboundVideoKbps,
-                    inboundFps: webRTCManager.inboundFps,
-                    inboundVideoPlayoutDelayMs: webRTCManager.inboundVideoPlayoutDelayMs,
-                    inboundVideoJitterMs: webRTCManager.inboundVideoJitterMs,
-                    inboundVideoDecodeMs: webRTCManager.inboundVideoDecodeMs,
-                    inboundVideoPacketsLost: webRTCManager.inboundVideoPacketsLost,
-                    iceCurrentRoundTripTimeMs: webRTCManager.iceCurrentRoundTripTimeMs,
-                    inboundAudioKbps: webRTCManager.inboundAudioKbps,
-                    inboundAudioPlayoutDelayMs: webRTCManager.inboundAudioPlayoutDelayMs,
-                    inboundAudioJitterMs: webRTCManager.inboundAudioJitterMs,
-                    inboundAudioPacketsLost: webRTCManager.inboundAudioPacketsLost,
-                    audioIceCurrentRoundTripTimeMs: webRTCManager.audioIceCurrentRoundTripTimeMs,
-                    onScan: {
-                        kvmDeviceManager.scanForDevices()
-                    },
-                    onManualConnect: {
-                        showingManualConnect = true
-                    },
-                    onToggleConnection: {
-                        toggleConnection()
-                    },
-                    onForgetSelectedDevice: {
-                        guard let device = selectedDevice else { return }
-                        guard device.id.hasPrefix("saved-") else { return }
-                        kvmDeviceManager.forgetDevice(device)
-                        selectedDevice = nil
-                    }
+            .frame(minWidth: 460, minHeight: 320)
+            .clipped()
+            if isCaptureSidebarVisible {
+                Divider()
+                CaptureSidebarView(
+                    onConnections: { showingConnections.toggle() },
+                    onSettings: { showingSettings.toggle() },
+                    onHide: { setCaptureSidebarVisible(false) },
+                    onNativeSize: { fitWindowToGuest(mode: .nativeResolution) },
+                    onFitDisplay: { fitWindowToGuest(mode: .fitDisplay) }
                 )
-                .frame(width: 360)
-                .background(.ultraThinMaterial)
-                .padding(.top, 8)
-
-                Spacer(minLength: 0)
+                .frame(width: captureSidebarWidth)
             }
-            .frame(maxHeight: .infinity)
-            .offset(x: showingConnections ? 0 : 360)
-            .animation(.easeInOut(duration: 0.2), value: showingConnections)
-            .allowsHitTesting(showingConnections)
         }
-        .background(WindowAspectRatioSetter(videoSize: webRTCManager.videoSize))
+        .background(WindowAspectRatioSetter(videoSize: webRTCManager.videoSize, sidebarWidth: visibleSidebarWidth))
         .background(WindowTitleSetter(title: windowTitle))
         .background(WindowReferenceSetter(window: $windowRef))
         .preferredColorScheme(preferredColorScheme)
@@ -287,10 +328,22 @@ struct ContentView: View {
                 showingConnections = true
             }
         }
+        .onChange(of: isCaptureSidebarVisible) { _, _ in
+            applyPendingSidebarResize()
+        }
         .onChange(of: showingSettings) { _, _ in
             updateInputCaptureForUIOverlays()
         }
         .onChange(of: showingConnections) { _, _ in
+            updateInputCaptureForUIOverlays()
+        }
+        .onChange(of: showingManualConnect) { _, _ in
+            updateInputCaptureForUIOverlays()
+        }
+        .onChange(of: showingPasswordPrompt) { _, _ in
+            updateInputCaptureForUIOverlays()
+        }
+        .onChange(of: isShowingOCRResult) { _, _ in
             updateInputCaptureForUIOverlays()
         }
         .onChange(of: windowRef) { _, newValue in
@@ -311,6 +364,7 @@ struct ContentView: View {
         }
         .onReceive(kvmDeviceManager.$glkvmClient) { client in
             inputManager.setGLKVMClient(client)
+            Task { @MainActor in updateInputCaptureForUIOverlays() }
         }
         .onReceive(kvmDeviceManager.$connectedDevice) { device in
             Task { @MainActor in
@@ -318,6 +372,8 @@ struct ContentView: View {
                     suppressDeviceAutoConnect = true
                     selectedDevice = device
                     isConnected = true
+                    showingConnections = false
+                    updateInputCaptureForUIOverlays()
                     DispatchQueue.main.async {
                         suppressDeviceAutoConnect = false
                     }
@@ -350,6 +406,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingPasswordPrompt) {
             PasswordPromptSheet(
+                host: pendingPasswordDevice?.host ?? "",
                 isPresented: $showingPasswordPrompt,
                 password: $pendingPassword,
                 onCancel: {
@@ -386,11 +443,15 @@ struct ContentView: View {
                     }
                     .help("Connections")
 
+                    sidebarToggleButton
+                    nativeSizeButton
+                    WakeHostButton()
+
                     Button(action: { fitWindowToGuest() }) {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                     }
                     .disabled(webRTCManager.videoSize == nil)
-                    .help("Fit window to guest")
+                    .help("Fit video to this screen")
 
                     Button(action: { toggleOCR() }) {
                         Image(systemName: isOCRModeEnabled ? "text.viewfinder" : "doc.text")
@@ -520,44 +581,60 @@ struct ContentView: View {
     }
 
     @MainActor
-    private func fitWindowToGuest() {
-        guard let videoSize = webRTCManager.videoSize,
-              videoSize.width > 0,
-              videoSize.height > 0 else { return }
-        guard let window = windowRef ?? NSApp.keyWindow else { return }
-
-        let currentFrame = window.frame
-        let currentLayout = window.contentLayoutRect
-
-        let deltaW = currentFrame.size.width - currentLayout.size.width
-        let deltaH = currentFrame.size.height - currentLayout.size.height
-
-        var desiredLayoutW = CGFloat(videoSize.width)
-        var desiredLayoutH = CGFloat(videoSize.height)
-
-        if let screen = window.screen ?? NSScreen.main {
-            let maxLayoutW = max(100, screen.visibleFrame.size.width - deltaW)
-            let maxLayoutH = max(100, screen.visibleFrame.size.height - deltaH)
-            let scale = min(1.0, maxLayoutW / desiredLayoutW, maxLayoutH / desiredLayoutH)
-            desiredLayoutW = floor(desiredLayoutW * scale)
-            desiredLayoutH = floor(desiredLayoutH * scale)
+    private func setCaptureSidebarVisible(_ visible: Bool) {
+        guard visible != isCaptureSidebarVisible else { return }
+        if let window = windowRef ?? NSApp.keyWindow, !window.styleMask.contains(.fullScreen) {
+            // Capture BEFORE SwiftUI changes minimum sizes. Subsequent rapid
+            // toggles use the pending absolute target, never an auto-expanded frame.
+            let oldFrame = pendingSidebarTarget ?? window.frame
+            pendingSidebarTarget = RemoteWindowGeometry.changingSidebar(
+                in: oldFrame, from: visibleSidebarWidth,
+                to: visible ? captureSidebarWidth + 1 : 0
+            )
+        } else {
+            pendingSidebarTarget = nil
         }
+        sidebarResizeRevision += 1
+        isCaptureSidebarVisible = visible
+    }
 
-        var newFrame = currentFrame
-        newFrame.size = NSSize(width: desiredLayoutW + deltaW, height: desiredLayoutH + deltaH)
-        newFrame.origin.y += currentFrame.size.height - newFrame.size.height
-        window.setFrame(newFrame, display: true, animate: true)
+    @MainActor
+    private func applyPendingSidebarResize() {
+        guard let window = windowRef ?? NSApp.keyWindow,
+              let target = pendingSidebarTarget else { return }
+        let revision = sidebarResizeRevision
+        DispatchQueue.main.async {
+            guard revision == sidebarResizeRevision else { return }
+            window.contentView?.layoutSubtreeIfNeeded()
+            if !window.styleMask.contains(.fullScreen) {
+                let coordinator = window.delegate as? WindowAspectRatioSetter.Coordinator
+                coordinator?.isApplyingExplicitFrame = true
+                window.setFrame(target, display: true)
+                coordinator?.isApplyingExplicitFrame = false
+            }
+            pendingSidebarTarget = nil
+        }
+    }
+
+    @MainActor
+    private func fitWindowToGuest(mode: RemoteWindowSizeMode = .fitDisplay) {
+        guard let resolution = webRTCManager.videoSize,
+              resolution.width > 0, resolution.height > 0,
+              let window = windowRef ?? NSApp.keyWindow else { return }
+        pendingSidebarTarget = nil
+        sidebarResizeRevision += 1
+        if let coordinator = window.delegate as? WindowAspectRatioSetter.Coordinator {
+            coordinator.resizeVideo(to: resolution, sidebarWidth: visibleSidebarWidth, mode: mode)
+        }
     }
 
     @MainActor
     private func updateInputCaptureForUIOverlays() {
-        let overlayOpen = showingSettings || showingConnections
+        let overlayOpen = showingSettings || showingConnections || showingManualConnect
+            || showingPasswordPrompt || isShowingOCRResult
 
         if overlayOpen {
             if isInputCapturePausedForUI == false {
-                pausedCaptureKeyboardWasEnabled = inputManager.isKeyboardCaptureEnabled
-                pausedCaptureMouseWasEnabled = inputManager.isMouseCaptureEnabled
-
                 if inputManager.isKeyboardCaptureEnabled {
                     inputManager.stopKeyboardCapture()
                 }
@@ -570,23 +647,14 @@ struct ContentView: View {
             return
         }
 
-        guard isInputCapturePausedForUI else { return }
-
-        if isConnected {
-            if let wasKeyboard = pausedCaptureKeyboardWasEnabled {
-                if wasKeyboard {
-                    inputManager.startKeyboardCapture()
-                }
+        if kvmDeviceManager.glkvmClient != nil {
+            if isInputCapturePausedForUI {
+                windowRef?.makeFirstResponder(windowRef?.contentView)
             }
-            if let wasMouse = pausedCaptureMouseWasEnabled {
-                if wasMouse {
-                    inputManager.startMouseCapture()
-                }
-            }
+            inputManager.startFullInputCapture()
+        } else {
+            inputManager.stopFullInputCapture()
         }
-
-        pausedCaptureKeyboardWasEnabled = nil
-        pausedCaptureMouseWasEnabled = nil
         isInputCapturePausedForUI = false
     }
 }
@@ -610,6 +678,7 @@ private struct WindowReferenceSetter: NSViewRepresentable {
 
 private struct WindowAspectRatioSetter: NSViewRepresentable {
     let videoSize: CGSize?
+    let sidebarWidth: CGFloat
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -621,6 +690,11 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         guard let window = nsView.window else { return }
+
+        // Toggle the panel within the existing window. AppKit/SwiftUI may already
+        // resize for minimum content sizes; adding width deltas here compounds
+        // those adjustments on repeated toggles.
+        context.coordinator.sidebarWidth = sidebarWidth
 
         if context.coordinator.didConfigureWindow == false {
             context.coordinator.didConfigureWindow = true
@@ -661,7 +735,7 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
             let deltaH = currentFrame.size.height - currentLayout.height
 
             if currentLayout.width > 0 {
-                let desiredLayoutHeight = currentLayout.width * (aspect.height / aspect.width)
+                let desiredLayoutHeight = max(1, currentLayout.width - sidebarWidth) * (aspect.height / aspect.width)
                 if desiredLayoutHeight.isFinite, desiredLayoutHeight > 0 {
                     var newFrame = currentFrame
                     newFrame.size.height = desiredLayoutHeight + deltaH
@@ -681,6 +755,35 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
         weak var window: NSWindow?
         weak var forwardedDelegate: NSWindowDelegate?
         var videoAspect: Double?
+        var sidebarWidth: CGFloat?
+        var isApplyingExplicitFrame = false
+        private var pendingVideoSize: (resolution: CGSize, sidebarWidth: CGFloat, mode: RemoteWindowSizeMode)?
+
+        func resizeVideo(to resolution: CGSize, sidebarWidth: CGFloat, mode: RemoteWindowSizeMode) {
+            guard let window else { return }
+            if window.styleMask.contains(.fullScreen) {
+                pendingVideoSize = (resolution, sidebarWidth, mode)
+                window.toggleFullScreen(nil)
+                return
+            }
+            let target = RemoteWindowGeometry.sizedForVideo(
+                frame: window.frame, contentSize: window.contentLayoutRect.size,
+                videoResolution: resolution, sidebarWidth: sidebarWidth,
+                availableScreen: (window.screen ?? NSScreen.main)?.visibleFrame, mode: mode
+            )
+            isApplyingExplicitFrame = true
+            window.setFrame(target, display: true)
+            isApplyingExplicitFrame = false
+        }
+
+        func finishFullscreenExit(window: NSWindow) {
+            if let request = pendingVideoSize {
+                pendingVideoSize = nil
+                resizeVideo(to: request.resolution, sidebarWidth: request.sidebarWidth, mode: request.mode)
+            } else {
+                adjustFrameToVideoAspect(window: window)
+            }
+        }
 
         private var storedWindowedTitlebarAppearsTransparent: Bool?
         private var storedWindowedStyleMaskHadFullSizeContentView: Bool?
@@ -746,7 +849,7 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
 
             guard currentLayout.width > 0 else { return }
 
-            let desiredLayoutH = currentLayout.width / aspect
+            let desiredLayoutH = max(1, currentLayout.width - (sidebarWidth ?? 0)) / aspect
             guard desiredLayoutH.isFinite, desiredLayoutH > 0 else { return }
 
             var newFrame = currentFrame
@@ -770,7 +873,7 @@ extension WindowAspectRatioSetter.Coordinator: NSWindowDelegate {
     }
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
-        guard let aspect = videoAspect else { return frameSize }
+        guard !isApplyingExplicitFrame, let aspect = videoAspect else { return frameSize }
 
         let currentFrame = sender.frame.size
         let currentLayout = sender.contentLayoutRect.size
@@ -778,7 +881,7 @@ extension WindowAspectRatioSetter.Coordinator: NSWindowDelegate {
         let deltaW = currentFrame.width - currentLayout.width
         let deltaH = currentFrame.height - currentLayout.height
 
-        let proposedLayoutW = frameSize.width - deltaW
+        let proposedLayoutW = frameSize.width - deltaW - (sidebarWidth ?? 0)
         let proposedLayoutH = frameSize.height - deltaH
 
         guard proposedLayoutW > 0, proposedLayoutH > 0 else { return frameSize }
@@ -792,7 +895,7 @@ extension WindowAspectRatioSetter.Coordinator: NSWindowDelegate {
             constrained = NSSize(width: frameSize.width, height: desiredLayoutH + deltaH)
         } else {
             let desiredLayoutW = proposedLayoutH * aspect
-            constrained = NSSize(width: desiredLayoutW + deltaW, height: frameSize.height)
+            constrained = NSSize(width: desiredLayoutW + deltaW + (sidebarWidth ?? 0), height: frameSize.height)
         }
 
         if let forwardedDelegate,
@@ -821,7 +924,7 @@ extension WindowAspectRatioSetter.Coordinator: NSWindowDelegate {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.adjustFrameToVideoAspect(window: window)
+            self.finishFullscreenExit(window: window)
         }
 
         forwardedDelegate?.windowDidExitFullScreen?(notification)
@@ -916,6 +1019,10 @@ struct ConnectionsPopoverView: View {
                 }
             }
             .frame(maxWidth: .infinity)
+
+            DeviceCertificateToggle(host: selectedDevice?.host ?? "")
+            MacShortcutControls()
+            WakeHostButton()
 
             HStack {
                 Button("Scan") { onScan() }

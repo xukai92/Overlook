@@ -95,6 +95,46 @@ Overlook uses the Swift Package:
 2. Select the `Overlook` scheme.
 3. Build + Run.
 
+### Build from a terminal
+
+On a new Mac, install full Xcode, open it once to complete setup, and check that
+`xcodebuild -version` reports Xcode rather than only Command Line Tools. Clone
+this fork with `git clone git@github.com:xukai92/Overlook.git` and run the
+following from the repository root:
+
+```sh
+xcodebuild -project Overlook.xcodeproj \
+  -scheme Overlook \
+  -configuration Debug \
+  -destination 'platform=macOS' \
+  -derivedDataPath /tmp/overlook-build \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
+Xcode resolves and downloads the pinned WebRTC dependency automatically. This
+build does not require an Apple Developer account. To install and run it after
+quitting any running copy of Overlook:
+
+```sh
+ditto /tmp/overlook-build/Build/Products/Debug/Overlook.app /Applications/Overlook.app
+codesign --force --deep --sign - /Applications/Overlook.app
+codesign --verify --deep --strict /Applications/Overlook.app
+open /Applications/Overlook.app
+```
+
+The local build is ad-hoc signed. Rebuilding can invalidate macOS keyboard
+permissions even if Overlook still appears enabled in System Settings. Enable
+**Forward macOS shortcuts** and check for **System keyboard capture ready**.
+If blocked, remove the old entry from **Privacy & Security → Device Control and
+Data Access** (called **Accessibility** on older macOS), add the current
+`/Applications/Overlook.app`, and click **Check access**. Grant permissions
+yourself when macOS prompts.
+
+Device addresses, login tokens, per-host certificate exceptions, and UI
+preferences are local to each Mac; cloning the repository does not transfer
+them. Join the appropriate network/VPN and connect to the device on the new Mac.
+See [AGENTS.md](./AGENTS.md) for coding-agent handoff instructions.
+
 ---
 
 ## Quick Start (How to use Overlook)
@@ -197,7 +237,36 @@ This is ideal for:
 
 Overlook includes a few “quality of life” shortcuts.
 
-### In-session shortcuts (while keyboard capture is enabled)
+### Forward macOS shortcuts
+
+For Mac-to-Mac control, use the **Forward macOS shortcuts** switch in the persistent right sidebar. The panel sits outside the video and remains available in fullscreen. Use the sidebar button in the toolbar (or fullscreen hover controls) to show/hide it; your choice is remembered. The sidebar also has a Hide button. In windowed mode it expands to the right and folds back on close, preserving the size and top-left position of the video area, including after repeated toggles. It also contains capture status, the live key display, wake, and connection/settings controls. You can also change the setting in Connections; close that panel to resume keyboard capture. Grant Overlook access in **System Settings → Privacy & Security → Device Control and Data Access** (called **Accessibility** on older macOS) when prompted. The app captures keyboard events while its window is active and input capture is enabled, so Command/Option combinations and Control+arrow keys can reach the remote Mac.
+
+The Connections panel reports **System keyboard capture ready** once macOS actually permits the event tap. If it reports blocked access after an update, remove the old Overlook entry from Device Control and Data Access / Accessibility and add `/Applications/Overlook.app` again, then click **Check access**. Ad-hoc signed development builds can need renewed permission after rebuilding.
+
+Enable **Show captured keys** to see the currently held keys, the latest key press/release, the event count, and whether the last event came through system or app-only capture. The display is live and in memory; no key history is saved to disk.
+
+The local mouse pointer hides over the active video while mouse capture is enabled. It returns outside the video, when capture pauses, when video is unavailable, or when Overlook loses focus. OCR mode keeps the local pointer visible.
+
+In this mode, `⌘C` and `⌘V` are forwarded to the remote Mac. Use the OCR toolbar control to copy text from video. Press **Control+Option+Escape** to release shortcut forwarding. Capture pauses for connection/settings panels and sheets, and held remote keys are released when capture pauses or Overlook loses focus. macOS secure input and some system-reserved keys may still prevent capture.
+
+### Window size and scrolling
+
+Use **Native size** in the toolbar or sidebar to make the video area match the
+remote resolution in macOS logical points: a 1920×1200 stream gets a
+1920×1200-point video area. Window chrome and the sidebar are added outside it.
+This deliberately does not divide the size by the local Retina scale or shrink
+it to fit the display. **Fit to screen** scales it down to fit the local screen.
+Both actions leave fullscreen before resizing if necessary.
+
+Enable **Invert scrolling** in the sidebar to reverse horizontal and vertical
+scrolling sent from this Mac. The choice is remembered locally and does not
+change the device's remote scroll settings.
+
+### Wake a sleeping display
+
+Use **Wake display** in the toolbar or Connections panel, or beside Reconnect when video is unavailable. It sends a brief Shift press through the device's authenticated HTTP HID API, independently of the video connection and keyboard capture. The remote Mac must support wake from its attached USB keyboard; this does not power on a shut-down Mac. Video requests retry when the device reports a streamer error.
+
+### In-session shortcuts (when shortcut forwarding is off)
 
 - `⌘C`: toggles OCR selection mode (so you can “copy” from the remote screen).
 - `⌘V`: pastes macOS clipboard to the remote.
@@ -300,7 +369,8 @@ Overlook’s settings UI lives in `Overlook/WebUISettingsPanel.swift` and is des
 
 ### Security notes
 
-- The app currently allows insecure TLS for device connections (useful for devices with self-signed certs).
+- Device certificate validation is enabled by default. In Connections or Manual Connect, enable **Allow self-signed device certificates** for a trusted device host, then reconnect. The choice is remembered per hostname and applies to the HTTP API, HID WebSocket, and WebRTC signaling. It also accepts expired certificates and hostname mismatches, so use it only over a trusted network or VPN.
+- The app declares an ATS exception to support user-supplied device hosts and custom certificate validation. Authenticated device sessions still validate certificates unless that host is explicitly opted in. Discovery probes accept self-signed certificates without sending credentials.
 - Treat your `auth_token` like a password.
 
 ---
@@ -310,3 +380,10 @@ Overlook’s settings UI lives in `Overlook/WebUISettingsPanel.swift` and is des
 This project is licensed under the **GNU General Public License v3.0**.
 
 See [`LICENSE.md`](./LICENSE.MD).
+
+### Input regression tests
+
+Run `Tests/run-input-tests.sh` on macOS. The tests compile the real input manager with an in-memory transport and cover Mac shortcut routing, modifier ordering, key release, wake without video, and input errors. They do not post system keyboard events or require a KVM connection.
+
+Run `Tests/run-window-tests.sh` for sidebar round-trip, native logical-resolution,
+and screen-fit sizing checks.

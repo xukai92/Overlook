@@ -1,5 +1,24 @@
 import Foundation
 
+// ATS must permit custom trust evaluation; this policy controls the opt-in per host.
+enum DeviceTLSPolicy {
+    static let defaultsKey = "overlook.tls.allowedHosts"
+
+    static func normalizedHost(_ input: String) -> String {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return URLComponents(string: value.contains("://") ? value : "https://" + value)?.host?.lowercased() ?? ""
+    }
+
+    static func allowedHosts(from data: Data) -> Set<String> {
+        Set((try? JSONDecoder().decode([String].self, from: data)) ?? [])
+    }
+
+    static func allowsUntrustedCertificate(for host: String) -> Bool {
+        allowedHosts(from: UserDefaults.standard.data(forKey: defaultsKey) ?? Data())
+            .contains(normalizedHost(host))
+    }
+}
+
 typealias GLKVMJSONObject = [String: JSONValue]
 
 struct GLKVMResponse<Result: Decodable>: Decodable {
@@ -240,9 +259,11 @@ final class GLKVMClient {
 
     private final class SessionDelegate: NSObject, URLSessionDelegate {
         let allowInsecureTLS: Bool
+        let expectedHost: String
 
-        init(allowInsecureTLS: Bool) {
+        init(allowInsecureTLS: Bool, expectedHost: String) {
             self.allowInsecureTLS = allowInsecureTLS
+            self.expectedHost = expectedHost.lowercased()
         }
 
         func urlSession(
@@ -251,6 +272,7 @@ final class GLKVMClient {
             completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
         ) {
             guard allowInsecureTLS,
+                  challenge.protectionSpace.host.lowercased() == expectedHost,
                   challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
                   let trust = challenge.protectionSpace.serverTrust else {
                 completionHandler(.performDefaultHandling, nil)
@@ -266,7 +288,7 @@ final class GLKVMClient {
 
     private let session: URLSession
 
-    init(host: String, port: Int = 443, authToken: String? = nil, allowInsecureTLS: Bool = true) throws {
+    init(host: String, port: Int = 443, authToken: String? = nil, allowInsecureTLS: Bool? = nil) throws {
         let scheme = Self.defaultHTTPScheme(for: port)
         guard let url = URL(string: "\(scheme)://\(host):\(port)") else {
             throw ClientError.invalidBaseURL
@@ -279,7 +301,7 @@ final class GLKVMClient {
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
 
-        self.session = URLSession(configuration: config, delegate: SessionDelegate(allowInsecureTLS: allowInsecureTLS), delegateQueue: nil)
+        self.session = URLSession(configuration: config, delegate: SessionDelegate(allowInsecureTLS: allowInsecureTLS ?? DeviceTLSPolicy.allowsUntrustedCertificate(for: host), expectedHost: url.host ?? host), delegateQueue: nil)
     }
 
     static func defaultHTTPScheme(for port: Int) -> String {
@@ -295,7 +317,7 @@ final class GLKVMClient {
         defaultHTTPScheme(for: port) == "https" ? "wss" : "ws"
     }
 
-    convenience init(device: KVMDevice, allowInsecureTLS: Bool = true) throws {
+    convenience init(device: KVMDevice, allowInsecureTLS: Bool? = nil) throws {
         try self.init(host: device.host, port: device.port, authToken: device.authToken.isEmpty ? nil : device.authToken, allowInsecureTLS: allowInsecureTLS)
     }
 
